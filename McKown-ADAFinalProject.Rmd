@@ -1,0 +1,238 @@
+---
+title: "ADAFinalProject"
+author: "Mara McKown"
+date: '2022-11-19'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## ADA Final Project
+### Install packages and libraries
+```{r, message=FALSE}
+pacman::p_load(readr, tidyverse, table1, dplyr, readxl, naniar, writexl, MASS, lmtest, stargazer, sandwich, broom)
+```
+
+### Upload Data
+```{r}
+#upload data from github
+df <- read.csv("https://raw.githubusercontent.com/msmckown/ADAfinalproject/main/ExploreMOhealth.finalprojdata.csv")
+```
+
+### Rename columns
+```{r}
+dput(names(df))
+df <- df %>% 
+  rename("zipcode" = "ZIP.Code",
+         "zipname" = "ZIP.Name",
+         "rankingindex" = "ZIP.Health.Ranking.Index.Score",
+         "healthrank" = "ZIP.Health.Rank",
+         "combinedindex" = "Health.Factors.Combined.Index.Score",
+         "combinedrank" = "Health.Factors.Combined.Rank",
+         "teenpregrate" = "Teen.Pregnancy.per.1.000",
+         "teenpregz" = "Teen.Pregnancy.per.1.000.Z.Score",
+         "teenpregrank" = "Teen.Pregnancy.Rank..of.937.",
+         "lbwrate" = "Low.Birthweight.per.1.000",
+         "lbwz" = "Low.Birthweight.per.1.000.Z.Score",
+         "lbwrank" = "Low.Birthweight.Rank..of.937.",
+         "hsedupercent" = "High.School.Education....",
+         "medianincome" = "Median.Household.Income....",
+         "qualityliferank" = "Quality.of.Life.Rank..of.937.",
+         "withouths" = "Low.Education...."
+         )
+```
+
+### Recoding
+```{r}
+#make variable that is percent of people with hs edu, by subtracting those without hs from 100
+df$withhs <- 100 - df$withouths
+
+# make high and low teen pregnancy cut off
+df <- df %>% 
+  mutate(teenpregh_l = case_when(teenpregrank >= 469 ~ "High",
+                                 teenpregrank <= 468 ~ "Low"))
+df$teenpregh_l <- factor(df$teenpregh_l, labels = c("High Teen Pregnancy Rates", "Low Teen Pregnancy Rates"))
+table1(~teenpregh_l, data = df) 
+table(df$teenpregrank, df$teenpregh_l)#just make sure it makes sense
+
+#just checking to make sure it all makes sense
+table1(~ lbwrate + withouths + withhs, data = df) 
+
+#change lbwrate to be whole numbers so can do Poisson (as they have two decimal places will multiply by 100 and the rate will change from out of 1,000 to out of 100,000)
+df$lbw100k <- df$lbwrate * 100
+#and with hs to be whole numbers so can do Poisson (will multiply by 1000 and the rate will change from out of 100 to out of 100,000)
+df$withhs100k <- df$withhs * 1000
+```
+
+### Descriptive Stats
+```{r}
+#add labels to variables
+label(df$withhs100k)<-"High School Education (out of 100k)"
+label(df$qualityliferank)<-"Quality of Life Ranking (of 937)"
+label(df$medianincome)<-"Median Income ($)"
+label(df$teenpregh_l)<-"Teen Pregnancy (High/Low)"
+label(df$lbw100k)<-"Low Birth Weight (out of 100k)"
+
+#descriptive table of outcomes separated by high vs. low teen pregnancy rates
+table1(~ withhs100k + lbw100k | teenpregh_l, data = df)
+
+#descriptive table of confounders
+table1(~qualityliferank + medianincome, data = df)
+table1(~qualityliferank + medianincome | teenpregh_l, data = df)
+
+#full descriptive table
+table1(~withhs100k + lbw100k + qualityliferank + medianincome | teenpregh_l, overall="Total", footnote='SD = standard deviation; teen pregnancy rates were categorized using the median zip code ranking of all zip codes in the state of Missouri as the cutoff value', data = df)
+
+#graphs of outcome variables
+lbwgraph <- ggplot(data = df, aes(lbw100k)) +
+  geom_histogram(aes(y = ..density..), bins = 15) +
+  geom_density() +
+  labs(x = "Low Birth Weight (per 100,000 births)") +
+  theme_bw()
+ggsave(filename = "lbw.png", path=NULL, plot = lbwgraph,
+       width = 7, height = 4, bg="white") #need to add path/change from Null if want to save plot on computer
+hsgraph <- ggplot(data = df, aes(withhs100k)) +
+  geom_histogram(aes(y = ..density..), bins = 15) +
+  geom_density() +
+  labs(x = "High School Education (per 100,000 people)") +
+  theme_bw()
+ggsave(filename = "hs.png", path=NULL, plot = hsgraph,
+       width = 7, height = 4, bg="white") #need to add path/change from Null if want to save plot on computer
+```
+
+### Model looking at how high vs. low teen pregnancy rate impacts lbw (w/o confounding)
+```{r}
+#Models without confounding
+##Poisson
+model0 <- glm(lbw100k ~ teenpregh_l, family ="poisson", data = df)
+summary(model0)
+broom::tidy(model0, conf.int = TRUE, exponentiate = TRUE)
+
+##Neg Binomial
+model0nb <- glm.nb(lbw100k ~ teenpregh_l, control=glm.control(maxit=50),  data = df)
+summary(model0nb)
+broom::tidy(model0nb, conf.int = TRUE, exponentiate = TRUE)
+#models had p<0.05 so decided to include confounding
+
+#compare SEs
+stargazer(model0, model0nb, title="Model Comparison",
+          type="text",align=TRUE,single.row=TRUE, digits=6)
+
+#robust SE and rest of negative binomial model using robust SEs
+robust0 <- tidy(coeftest(model0nb, vcov. = vcovHC(model0nb, type = 'HC3'))) 
+robust0$IRR<- exp(robust0$estimate) #incidence rate ratio
+robust0$lowCI <- exp(robust0$estimate - 1.96*robust0$std.error)
+robust0$highCI <- exp(robust0$estimate + 1.96*robust0$std.error)
+robust0
+```
+
+### Model looking at how high vs. low teen pregnancy rate impacts lbw (w/ confounding)
+```{r}
+#Models with confounding
+##Poisson model
+model1 <- glm(lbw100k ~ teenpregh_l + qualityliferank + medianincome, family ="poisson", data = df)
+summary(model1)
+broom::tidy(model1, conf.int = TRUE, exponentiate = TRUE)
+
+##Negative Binomial model
+model1nb <- glm.nb(lbw100k ~ teenpregh_l + qualityliferank + medianincome, control=glm.control(maxit=50),  data = df)
+summary(model1nb)
+broom::tidy(model1nb, conf.int = TRUE, exponentiate = TRUE)
+
+#run lrtest to compare models
+lrtest(model1, model1nb)
+#models are significantly different, so overdispersion and should use negative binomial model
+
+#compare SEs
+stargazer(model1, model1nb, title="Model Comparison",
+          type="text",align=TRUE,single.row=TRUE, digits=6)
+
+#robust SE and rest of negative binomial model using robust SEs
+robust1 <- tidy(coeftest(model1nb, vcov. = vcovHC(model1nb, type = 'HC3'))) 
+robust1$IRR<- exp(robust1$estimate) #incidence rate ratio
+robust1$lowCI <- exp(robust1$estimate - 1.96*robust1$std.error)
+robust1$highCI <- exp(robust1$estimate + 1.96*robust1$std.error)
+robust1
+
+#Zip codes with low teen pregnancy rates had 0.83 (95% CI 0.68, 1.02) times the incident rate of low birth weight compared to those with high rates after asjusting for potential confounding variables.
+```
+
+### Model looking at how high vs. low teen pregnancy rate impacts high school education (w/o confounding)
+```{r}
+##No confounding
+#Poisson model
+model4 <- glm(withhs100k ~ teenpregh_l, family ="poisson", data = df)
+summary(model4)
+broom::tidy(model4, conf.int = TRUE, exponentiate = TRUE)
+
+#Negative Binomial model
+model4nb <- glm.nb(withhs100k ~ teenpregh_l, control=glm.control(maxit=50),  data = df)
+summary(model4nb)
+broom::tidy(model4nb, conf.int = TRUE, exponentiate = TRUE)
+
+#run lrtest to compare models
+lrtest(model4, model4nb)
+#models are significantly different, so over dispersion and should use negative binomial model
+
+#compare SEs
+stargazer(model4, model4nb, title="Model Comparison",
+          type="text",align=TRUE,single.row=TRUE, digits=6)
+
+#robust SE and rest of negative binomial model using robust SEs
+robust4 <-tidy(coeftest(model4nb, vcov. = vcovHC(model4nb, type = 'HC3'))) 
+robust4$IRR<- exp(robust4$estimate) #incidence rate ratio
+robust4$lowCI <- exp(robust4$estimate - 1.96*robust4$std.error)
+robust4$highCI <- exp(robust4$estimate + 1.96*robust4$std.error)
+robust4
+```
+
+
+### Model looking at how high vs. low teen pregnancy rate impacts high school education (w/ confounding)
+```{r}
+##with confounding
+#Poisson model
+model2 <- glm(withhs100k ~ teenpregh_l + qualityliferank + medianincome, family ="poisson", data = df)
+summary(model2)
+broom::tidy(model2, conf.int = TRUE, exponentiate = TRUE)
+
+#Negative Binomial model
+model2nb <- glm.nb(withhs100k ~ teenpregh_l + qualityliferank + medianincome, control=glm.control(maxit=50),  data = df)
+summary(model2nb)
+broom::tidy(model2nb, conf.int = TRUE, exponentiate = TRUE)
+
+#run lrtest to compare models
+lrtest(model2, model2nb)
+#models are significantly different, so over dispersion and should use negative binomial model
+
+#compare SEs
+stargazer(model2, model2nb, title="Model Comparison",
+          type="text",align=TRUE,single.row=TRUE, digits=6)
+
+#robust SE and rest of negative binomial model using robust SEs
+robust2 <-tidy(coeftest(model2nb, vcov. = vcovHC(model2nb, type = 'HC3'))) 
+robust2$IRR<- exp(robust2$estimate) #incidence rate ratio
+robust2$lowCI <- exp(robust2$estimate - 1.96*robust2$std.error)
+robust2$highCI <- exp(robust2$estimate + 1.96*robust2$std.error)
+robust2
+
+#Zip codes with low teen pregnancy rates had 0.99 (95% CI 0.95, 1.02) times the incident rate of high school education compared to zip codes with high rates of teen pregnancy after adjusting for potential confounding variables.
+```
+
+#need to look to see if quality of life is an effect modifier for relationship between teen pregnancy and low birth weight
+```{r}
+#Negative Binomial model without interaction
+model3nb <- glm.nb(lbw100k ~ teenpregh_l + qualityliferank + medianincome, control=glm.control(maxit=50),  data = df)
+summary(model3nb)
+broom::tidy(model3nb, conf.int = TRUE, exponentiate = TRUE)
+
+#Negative Binomial model with interaction
+model3nb_int <- glm.nb(lbw100k ~ teenpregh_l + qualityliferank + medianincome + qualityliferank*teenpregh_l, control=glm.control(maxit=50),  data = df)
+summary(model3nb_int)
+broom::tidy(model3nb_int, conf.int = TRUE, exponentiate = TRUE)
+
+#run lrtest to compare models
+lrtest(model3nb, model3nb_int)
+#models are not significantly different so effect modification is not present
+```
